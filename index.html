@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#11151d">
+<title>Slice Rush Mobile</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#11151d;touch-action:none;overscroll-behavior:none}
+  body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  canvas{display:block;width:100vw;height:100dvh;touch-action:none}
+  #hud{position:fixed;inset:0;pointer-events:none;color:#f3f6f9}
+  #top{display:flex;justify-content:space-between;padding:calc(env(safe-area-inset-top) + 14px) 18px 0;font-weight:800;font-size:clamp(18px,4vw,30px);text-shadow:0 2px 8px #000}
+  #combo{position:absolute;top:18%;left:50%;transform:translateX(-50%);font-size:clamp(34px,9vw,74px);font-weight:1000;color:#ffd75b;text-shadow:0 3px 12px #000;opacity:0}
+  #overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.48);backdrop-filter:blur(2px);color:#fff;text-align:center;padding:24px}
+  #panel{max-width:560px}
+  h1{font-size:clamp(46px,13vw,86px);margin:0 0 14px;letter-spacing:-2px}
+  p{font-size:clamp(18px,4.7vw,28px);line-height:1.45;margin:8px 0}
+  .accent{color:#ffd75b;font-weight:800}
+  button{margin-top:20px;border:0;border-radius:16px;padding:15px 24px;font-size:20px;font-weight:900;background:#fff;color:#11151d}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud">
+  <div id="top"><div id="score">SCORE 0</div><div id="lives">♥ ♥ ♥</div></div>
+  <div id="combo">2 COMBO</div>
+</div>
+
+<div id="overlay">
+  <div id="panel">
+    <h1>SLICE RUSH</h1>
+    <p>손가락으로 화면을 <span class="accent">빠르게 그어 과일을 베세요.</span></p>
+    <p>폭탄은 피하고, 놓친 과일도 목숨이 줄어듭니다.</p>
+    <button id="startBtn">시작</button>
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d", {alpha:false});
+const overlay = document.getElementById("overlay");
+const panel = document.getElementById("panel");
+const startBtn = document.getElementById("startBtn");
+const scoreEl = document.getElementById("score");
+const livesEl = document.getElementById("lives");
+const comboEl = document.getElementById("combo");
+
+let W=0,H=0,dpr=1;
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = Math.floor(W*dpr);
+  canvas.height = Math.floor(H*dpr);
+  canvas.style.width = W+"px";
+  canvas.style.height = H+"px";
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener("resize",resize,{passive:true});
+resize();
+
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const rand=(a,b)=>a+Math.random()*(b-a);
+const choice=a=>a[(Math.random()*a.length)|0];
+
+const fruitColors=["#ef514f","#f8ad3d","#f4dc4d","#5fc973","#5dabeb","#aa74dd"];
+
+function segPointDist(ax,ay,bx,by,px,py){
+  const abx=bx-ax, aby=by-ay, apx=px-ax, apy=py-ay;
+  const den=abx*abx+aby*aby;
+  if(den<1e-9) return Math.hypot(apx,apy);
+  const t=clamp((apx*abx+apy*aby)/den,0,1);
+  const qx=ax+abx*t, qy=ay+aby*t;
+  return Math.hypot(px-qx,py-qy);
+}
+
+class Particle{
+  constructor(x,y,vx,vy,color,life,r){
+    Object.assign(this,{x,y,vx,vy,color,life,maxLife:life,r});
+  }
+  update(dt){
+    this.life-=dt;
+    this.vy += H*0.62*dt;
+    this.x += this.vx*dt;
+    this.y += this.vy*dt;
+  }
+  draw(){
+    if(this.life<=0)return;
+    ctx.globalAlpha=clamp(this.life/this.maxLife,0,1);
+    ctx.fillStyle=this.color;
+    ctx.beginPath();
+    ctx.arc(this.x,this.y,Math.max(1,this.r*this.life/this.maxLife),0,Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha=1;
+  }
+}
+
+class FlyingObject{
+  constructor(x,y,vx,vy,r){
+    Object.assign(this,{x,y,vx,vy,r,angle:rand(0,Math.PI*2),spin:rand(-4,4),dead:false,sliced:false});
+  }
+  update(dt){
+    this.vy += H*1.34*dt;
+    this.x += this.vx*dt;
+    this.y += this.vy*dt;
+    this.angle += this.spin*dt;
+  }
+  hit(seg){
+    if(!seg||this.dead||this.sliced)return false;
+    return segPointDist(seg.ax,seg.ay,seg.bx,seg.by,this.x,this.y) <= this.r+10;
+  }
+  offscreen(){
+    return this.y-this.r>H+90 || this.x<-140 || this.x>W+140;
+  }
+}
+
+class Fruit extends FlyingObject{
+  constructor(x,y,vx,vy){
+    const r=rand(Math.min(W,H)*.038,Math.min(W,H)*.055);
+    super(x,y,vx,vy,r);
+    this.color=choice(fruitColors);
+    this.cutLife=0;
+    this.sep=0;
+  }
+  slice(){
+    if(this.sliced)return;
+    this.sliced=true;
+    this.cutLife=.46;
+    game.fruitSliced(this);
+    for(let i=0;i<20;i++){
+      const a=rand(0,Math.PI*2),s=rand(80,300);
+      game.particles.push(new Particle(
+        this.x,this.y,Math.cos(a)*s+this.vx*.18,Math.sin(a)*s+this.vy*.1,
+        this.color,rand(.35,.72),rand(2,7)
+      ));
+    }
+  }
+  update(dt){
+    super.update(dt);
+    if(this.sliced){
+      this.cutLife-=dt;
+      this.sep+=85*dt;
+      if(this.cutLife<=0)this.dead=true;
+    }
+  }
+  drawWhole(x=this.x,y=this.y){
+    ctx.fillStyle=this.color;
+    ctx.beginPath();ctx.arc(x,y,this.r,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="rgba(255,255,255,.72)";
+    ctx.beginPath();ctx.arc(x-this.r*.28,y-this.r*.3,this.r*.13,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle="#684527";ctx.lineWidth=Math.max(3,this.r*.1);
+    ctx.beginPath();ctx.moveTo(x,y-this.r*.9);ctx.lineTo(x+this.r*.14,y-this.r*1.25);ctx.stroke();
+    ctx.fillStyle="#4c9e4e";
+    ctx.beginPath();ctx.ellipse(x+this.r*.22,y-this.r*1.22,this.r*.27,this.r*.12,-.25,0,Math.PI*2);ctx.fill();
+  }
+  draw(){
+    if(!this.sliced){this.drawWhole();return;}
+    ctx.save();
+    ctx.translate(this.x-this.sep,this.y);
+    ctx.rotate(this.angle-.18);
+    ctx.beginPath();ctx.rect(-this.r*1.2,-this.r*1.2,this.r*1.2,this.r*2.4);ctx.clip();
+    this.drawWhole(0,0);
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(this.x+this.sep,this.y);
+    ctx.rotate(this.angle+.18);
+    ctx.beginPath();ctx.rect(0,-this.r*1.2,this.r*1.2,this.r*2.4);ctx.clip();
+    this.drawWhole(0,0);
+    ctx.restore();
+  }
+}
+
+class Bomb extends FlyingObject{
+  constructor(x,y,vx,vy){
+    super(x,y,vx,vy,Math.min(W,H)*.046);
+  }
+  slice(){
+    if(this.sliced)return;
+    this.sliced=this.dead=true;
+    game.bombSliced(this);
+    for(let i=0;i<32;i++){
+      const a=rand(0,Math.PI*2),s=rand(120,430);
+      game.particles.push(new Particle(
+        this.x,this.y,Math.cos(a)*s,Math.sin(a)*s,
+        choice(["#ffc34d","#ff664f","#8f9298"]),rand(.3,.8),rand(3,8)
+      ));
+    }
+  }
+  draw(){
+    ctx.fillStyle="#23262b";ctx.beginPath();ctx.arc(this.x,this.y,this.r,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle="#80552d";ctx.lineWidth=5;
+    ctx.beginPath();ctx.moveTo(this.x+this.r*.38,this.y-this.r*.68);ctx.lineTo(this.x+this.r*.8,this.y-this.r*1.08);ctx.stroke();
+    ctx.fillStyle=((performance.now()/90)|0)%2?"#ffd44e":"#ff5d4d";
+    ctx.beginPath();ctx.arc(this.x+this.r*.88,this.y-this.r*1.18,7,0,Math.PI*2);ctx.fill();
+  }
+}
+
+class Blade{
+  constructor(){this.points=[];this.pending=[];this.active=false;}
+  push(x,y){
+    const t=performance.now();
+    const last=this.points[this.points.length-1];
+    this.points.push({x,y,t});
+    if(last)this.pending.push({ax:last.x,ay:last.y,bx:x,by:y});
+    if(this.points.length>18)this.points.shift();
+  }
+  update(){
+    const now=performance.now();
+    this.points=this.points.filter(p=>now-p.t<180);
+  }
+  consume(){
+    const out=this.pending;
+    this.pending=[];
+    return out;
+  }
+  draw(){
+    if(this.points.length<2)return;
+    for(let i=1;i<this.points.length;i++){
+      const a=this.points[i-1],b=this.points[i];
+      ctx.strokeStyle=`rgba(115,201,255,${i/this.points.length})`;
+      ctx.lineWidth=2+11*i/this.points.length;
+      ctx.lineCap="round";
+      ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+    }
+    const p=this.points[this.points.length-1];
+    ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(p.x,p.y,4,0,Math.PI*2);ctx.fill();
+  }
+}
+
+const blade=new Blade();
+let pointerDown=false;
+
+canvas.addEventListener("pointerdown",e=>{
+  e.preventDefault();
+  pointerDown=true;
+  canvas.setPointerCapture?.(e.pointerId);
+  blade.active=true;
+  blade.points=[];
+  blade.pending=[];
+  blade.push(e.clientX,e.clientY);
+},{passive:false});
+
+canvas.addEventListener("pointermove",e=>{
+  if(!pointerDown)return;
+  e.preventDefault();
+  const events=e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for(const ev of events)blade.push(ev.clientX,ev.clientY);
+},{passive:false});
+
+function endPointer(e){
+  if(!pointerDown)return;
+  e.preventDefault();
+  if(Number.isFinite(e.clientX)&&Number.isFinite(e.clientY))blade.push(e.clientX,e.clientY);
+  pointerDown=false;
+  blade.active=false;
+}
+canvas.addEventListener("pointerup",endPointer,{passive:false});
+canvas.addEventListener("pointercancel",endPointer,{passive:false});
+
+class Game{
+  constructor(){this.reset();this.running=false;}
+  reset(){
+    this.objects=[];this.particles=[];
+    this.score=0;this.lives=3;this.combo=0;this.best=0;
+    this.comboTimer=0;this.elapsed=0;this.spawnTimer=.35;
+    this.flash=0;this.shake=0;this.gameOver=false;
+    scoreEl.textContent="SCORE 0";livesEl.textContent="♥ ♥ ♥";comboEl.style.opacity=0;
+  }
+  start(){this.reset();this.running=true;overlay.style.display="none";}
+  fruitSliced(){
+    this.combo++;this.comboTimer=.52;this.best=Math.max(this.best,this.combo);
+    this.score += 10 + Math.max(0,this.combo-1)*2;
+    this.shake=Math.max(this.shake,2.5);
+    scoreEl.textContent="SCORE "+this.score;
+  }
+  bombSliced(){
+    this.lives--;this.combo=0;this.comboTimer=0;this.flash=.30;this.shake=14;
+    if(navigator.vibrate)navigator.vibrate([35,25,55]);
+    this.refreshLives();
+    if(this.lives<=0)this.end();
+  }
+  missFruit(){
+    this.lives--;this.combo=0;this.comboTimer=0;this.shake=Math.max(this.shake,6);
+    this.refreshLives();
+    if(this.lives<=0)this.end();
+  }
+  refreshLives(){livesEl.textContent="♥ ".repeat(Math.max(0,this.lives)).trim();}
+  end(){
+    this.gameOver=true;this.running=false;
+    panel.innerHTML=`<h1>GAME OVER</h1>
+      <p>SCORE <span class="accent">${this.score}</span></p>
+      <p>BEST COMBO ${this.best}</p>
+      <button id="restartBtn">다시 시작</button>`;
+    overlay.style.display="flex";
+    document.getElementById("restartBtn").onclick=()=>this.start();
+  }
+  spawnWave(){
+    const d=clamp(this.elapsed/55,0,1);
+    let count;
+    const r=Math.random();
+    if(d<.25)count=r<.55?1:r<.9?2:3;
+    else if(d<.6)count=r<.25?2:r<.72?3:r<.93?4:5;
+    else count=r<.18?3:r<.55?4:r<.84?5:6;
+
+    if(Math.random()<.15+d*.22)count++;
+
+    for(let i=0;i<count;i++){
+      const x=rand(W*.12,W*.88),y=H+rand(25,80);
+      const apexY=rand(H*.18,H*.42);
+      const vy=-Math.sqrt(Math.max(1,2*(H*1.34)*(y-apexY)));
+      const tUp=-vy/(H*1.34);
+      const targetX=W*.5+rand(-W*.11,W*.11);
+      let vx=(targetX-x)/Math.max(.2,tUp);
+      vx*=rand(.9,1.1);
+
+      const bombChance=.07+d*.10;
+      this.objects.push(Math.random()<bombChance?new Bomb(x,y,vx,vy):new Fruit(x,y,vx,vy));
+    }
+
+    const base=1.02-d*.47;
+    this.spawnTimer=rand(base*.72,base*1.16);
+  }
+  update(dt){
+    if(!this.running)return;
+    this.elapsed+=dt;
+    this.comboTimer-=dt;
+    if(this.comboTimer<=0)this.combo=0;
+
+    this.flash=Math.max(0,this.flash-dt);
+    this.shake=Math.max(0,this.shake-dt*22);
+
+    this.spawnTimer-=dt;
+    if(this.spawnTimer<=0)this.spawnWave();
+
+    blade.update();
+    const segments=blade.consume();
+    if(segments.length){
+      for(const seg of segments){
+        for(const o of this.objects){
+          if(o.hit(seg))o.slice();
+        }
+      }
+    }
+
+    for(const o of this.objects)o.update(dt);
+    for(const p of this.particles)p.update(dt);
+
+    for(const o of this.objects){
+      if(o instanceof Fruit && !o.sliced && !o.dead && o.offscreen()){
+        o.dead=true;this.missFruit();
+      }else if(o instanceof Bomb && o.offscreen())o.dead=true;
+    }
+
+    this.objects=this.objects.filter(o=>!o.dead);
+    this.particles=this.particles.filter(p=>p.life>0);
+
+    if(this.combo>=2){
+      comboEl.textContent=this.combo+" COMBO";
+      comboEl.style.opacity=String(clamp(this.comboTimer/.52,0,1));
+    }else comboEl.style.opacity=0;
+  }
+  draw(){
+    ctx.fillStyle="#121721";ctx.fillRect(0,0,W,H);
+
+    ctx.strokeStyle="#1d2632";ctx.lineWidth=1;
+    const grid=Math.max(70,Math.min(W,H)*.12);
+    for(let x=0;x<W;x+=grid){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+    for(let y=0;y<H;y+=grid){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+
+    const sx=this.shake?rand(-this.shake,this.shake):0;
+    const sy=this.shake?rand(-this.shake,this.shake):0;
+    ctx.save();ctx.translate(sx,sy);
+    for(const o of this.objects)o.draw();
+    for(const p of this.particles)p.draw();
+    blade.draw();
+    ctx.restore();
+
+    if(this.flash>0){
+      ctx.fillStyle=`rgba(255,80,65,${clamp(this.flash/.3,0,1)*.55})`;
+      ctx.fillRect(0,0,W,H);
+    }
+  }
+}
+
+const game=new Game();
+startBtn.onclick=()=>game.start();
+
+let last=performance.now();
+function loop(now){
+  const dt=Math.min(.035,(now-last)/1000);
+  last=now;
+  game.update(dt);
+  game.draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
